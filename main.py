@@ -15,7 +15,7 @@ Or set environment variables (comma-separated for multiple accounts):
   JUNIOR_ACCOUNTS=token1|uid1|jid1,token2|uid2|jid2,...
   (Legacy single-account: JUNIOR_TOKEN, JUNIOR_UID, JUNIOR_ID)
 
-Manage accounts at runtime:
+Manage accounts at runtime (requires ADMIN_KEY):
   GET  /accounts        - List all accounts
   POST /accounts        - Add account {"token":..., "uid":..., "junior_id":...}
   DELETE /accounts/{id} - Remove account by index
@@ -33,19 +33,17 @@ import json
 import time
 import uuid
 import os
-import itertools
 import threading
-from typing import Optional
+from typing import AsyncIterator
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse as _FileResponse
 from pathlib import Path
 
-app = FastAPI(title="Junior.so OpenAI Proxy", version="0.2.0")
+app = FastAPI(title="Junior.so OpenAI Proxy", version="0.3.0")
 
 _DIR = Path(__file__).parent
 
@@ -56,6 +54,22 @@ async def test_page():
 
 JUNIOR_BASE = "https://junior.so/api"
 ACCOUNTS_FILE = _DIR / "accounts.json"
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+
+
+# ── Admin auth dependency ───────────────────────────────────
+async def require_admin(request: Request):
+    """Verify admin key for account management endpoints."""
+    if not ADMIN_KEY:
+        return  # No key configured = no protection (local dev)
+    auth = request.headers.get("authorization", "")
+    key = request.query_params.get("admin_key", "")
+    if auth == f"Bearer {ADMIN_KEY}" or key == ADMIN_KEY:
+        return
+    return JSONResponse(
+        status_code=403,
+        content={"error": "Forbidden. Set ADMIN_KEY env var and pass it via Authorization: Bearer <key> or ?admin_key=<key>"},
+    )
 
 
 # ── Account Pool ────────────────────────────────────────────
@@ -63,13 +77,12 @@ class AccountPool:
     """Thread-safe round-robin pool of junior.so accounts."""
 
     def __init__(self):
-        self._accounts: list[dict] = []  # [{"token": ..., "uid": ..., "junior_id": ...}]
+        self._accounts: list[dict] = []
         self._lock = threading.Lock()
         self._index = 0
 
     def load_from_env(self):
         """Load accounts from environment variables."""
-        # New format: JUNIOR_ACCOUNTS=token1|uid1|jid1,token2|uid2|jid2
         accounts_str = os.environ.get("JUNIOR_ACCOUNTS", "")
         if accounts_str:
             for entry in accounts_str.split(","):
@@ -77,12 +90,10 @@ class AccountPool:
                 if len(parts) == 3:
                     self.add(parts[0], parts[1], parts[2])
 
-        # Legacy single-account env vars
         token = os.environ.get("JUNIOR_TOKEN", "")
         uid = os.environ.get("JUNIOR_UID", "")
         jid = os.environ.get("JUNIOR_ID", "")
         if token and uid and jid:
-            # Avoid duplicate if already loaded from JUNIOR_ACCOUNTS
             if not any(a["token"] == token and a["uid"] == uid for a in self._accounts):
                 self.add(token, uid, jid)
 
@@ -97,12 +108,8 @@ class AccountPool:
             except (json.JSONDecodeError, KeyError):
                 pass
 
-    def save_to_file(self):
-        """Persist accounts to JSON file. Caller must NOT hold _lock."""
-        ACCOUNTS_FILE.write_text(json.dumps(self._accounts, indent=2))
-
-    def _save_locked(self):
-        """Persist accounts; caller already holds _lock."""
+    def _save(self):
+        """Persist accounts to JSON file. Caller must hold _lock."""
         ACCOUNTS_FILE.write_text(json.dumps(self._accounts, indent=2))
 
     def add(self, token: str, uid: str, junior_id: str) -> int:
@@ -110,7 +117,7 @@ class AccountPool:
         with self._lock:
             self._accounts.append({"token": token, "uid": uid, "junior_id": junior_id})
             idx = len(self._accounts) - 1
-        self.save_to_file()
+            self._save()
         return idx
 
     def remove(self, index: int) -> bool:
@@ -120,7 +127,7 @@ class AccountPool:
                 self._accounts.pop(index)
                 if self._index >= len(self._accounts):
                     self._index = 0
-                self._save_locked()
+                self._save()
                 return True
         return False
 
@@ -166,17 +173,19 @@ def parse_auth(request: Request) -> tuple[str, str, str]:
         parts = auth[7:].split("|")
         if len(parts) == 3:
             return parts[0], parts[1], parts[2]
-    # Round-robin from pool
     result = pool.next()
     if result:
         return result
     return "", "", ""
 
 
-# ── Account Management Endpoints ────────────────────────────
+# ── Account Management Endpoints (admin-protected) ──────────
 @app.get("/accounts")
-async def list_accounts():
+async def list_accounts(request: Request):
     """List all accounts in the pool."""
+    denied = await require_admin(request)
+    if denied:
+        return denied
     return {
         "total": pool.count,
         "accounts": pool.list_all(),
@@ -186,6 +195,9 @@ async def list_accounts():
 @app.post("/accounts")
 async def add_account(request: Request):
     """Add a new account. Body: {"token": ..., "uid": ..., "junior_id": ...}"""
+    denied = await require_admin(request)
+    if denied:
+        return denied
     body = await request.json()
     token = body.get("token", "").strip()
     uid = body.get("uid", "").strip()
@@ -199,8 +211,11 @@ async def add_account(request: Request):
 
 
 @app.delete("/accounts/{index}")
-async def remove_account(index: int):
+async def remove_account(index: int, request: Request):
     """Remove account by index."""
+    denied = await require_admin(request)
+    if denied:
+        return denied
     if pool.remove(index):
         return {"message": "Account removed", "total": pool.count}
     return JSONResponse(status_code=404, content={"error": "Account not found"})
@@ -219,24 +234,23 @@ def junior_headers(token: str, uid: str, junior_id: str) -> dict:
     }
 
 
-def get_or_create_conversation(token: str, uid: str, junior_id: str) -> str:
+async def get_or_create_conversation(token: str, uid: str, junior_id: str) -> str:
     """Get existing conversation or let junior.so create one automatically."""
     headers = junior_headers(token, uid, junior_id)
-    with httpx.Client(timeout=30) as client:
-        resp = client.get(f"{JUNIOR_BASE}/c/conversations", headers=headers)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{JUNIOR_BASE}/c/conversations", headers=headers)
         resp.raise_for_status()
         data = resp.json()
         convos = data.get("data", [])
         if convos:
             return convos[0]["id"]
-    # No conversations exist — send to a new one; junior.so auto-creates
     return "new"
 
 
-def send_message_to_junior(
+async def send_message_to_junior(
     conv_id: str, text: str, token: str, uid: str, junior_id: str
-):
-    """Send message to junior.so and yield SSE lines."""
+) -> AsyncIterator[str]:
+    """Send message to junior.so and yield SSE lines (async)."""
     headers = junior_headers(token, uid, junior_id)
     boundary = "JuniorProxy" + uuid.uuid4().hex[:8]
     body = (
@@ -247,15 +261,15 @@ def send_message_to_junior(
     )
     headers["content-type"] = f"multipart/form-data; boundary=----{boundary}"
 
-    with httpx.Client(timeout=180) as client:
-        with client.stream(
+    async with httpx.AsyncClient(timeout=180) as client:
+        async with client.stream(
             "POST",
             f"{JUNIOR_BASE}/c/conversations/{conv_id}/messages",
             headers=headers,
             content=body.encode(),
         ) as resp:
             resp.raise_for_status()
-            for line in resp.iter_lines():
+            async for line in resp.aiter_lines():
                 if line:
                     yield line
 
@@ -299,8 +313,6 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     stream = body.get("stream", False)
 
-    # Combine all user messages into one prompt for junior.so
-    # (junior.so doesn't support multi-turn message arrays)
     text_parts = []
     for msg in messages:
         role = msg.get("role", "user")
@@ -313,8 +325,7 @@ async def chat_completions(request: Request):
             text_parts.append(f"[Previous response]: {content}")
     text = "\n".join(text_parts)
 
-    # Get or create conversation
-    conv_id = get_or_create_conversation(token, uid, junior_id)
+    conv_id = await get_or_create_conversation(token, uid, junior_id)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
@@ -329,12 +340,12 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        return _non_stream_response(
+        return await _non_stream_response(
             conv_id, text, token, uid, junior_id, completion_id, created
         )
 
 
-def _non_stream_response(
+async def _non_stream_response(
     conv_id: str,
     text: str,
     token: str,
@@ -348,7 +359,7 @@ def _non_stream_response(
     input_tokens = 0
     output_tokens = 0
 
-    for line in send_message_to_junior(conv_id, text, token, uid, junior_id):
+    async for line in send_message_to_junior(conv_id, text, token, uid, junior_id):
         if line.startswith("data: "):
             try:
                 data = json.loads(line[6:])
@@ -390,7 +401,7 @@ async def _stream_response(
     created: int,
 ):
     """Stream OpenAI-format SSE chunks."""
-    for line in send_message_to_junior(conv_id, text, token, uid, junior_id):
+    async for line in send_message_to_junior(conv_id, text, token, uid, junior_id):
         if not line.startswith("data: "):
             continue
         try:
@@ -415,7 +426,6 @@ async def _stream_response(
             yield f"data: {json.dumps(chunk)}\n\n"
 
         elif "input_tokens" in data:
-            # Final chunk with finish_reason
             chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
