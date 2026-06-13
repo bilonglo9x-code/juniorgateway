@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Junior.so Proxy - API Test</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+        h1 { color: #e94560; margin-bottom: 5px; font-size: 24px; }
+        .subtitle { color: #888; margin-bottom: 20px; font-size: 14px; }
+        .test-section { background: #16213e; border-radius: 10px; padding: 15px; margin-bottom: 15px; border: 1px solid #0f3460; }
+        .test-title { color: #e94560; font-size: 16px; font-weight: bold; margin-bottom: 8px; }
+        .method { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-right: 8px; }
+        .get { background: #2ecc71; color: #000; }
+        .post { background: #f39c12; color: #000; }
+        .endpoint { font-family: monospace; color: #aaa; }
+        .btn { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; margin: 5px 5px 5px 0; }
+        .btn-primary { background: #e94560; color: white; }
+        .btn-primary:hover { background: #c0392b; }
+        .btn-stream { background: #3498db; color: white; }
+        .btn-stream:hover { background: #2980b9; }
+        .response { background: #0a0a1a; border-radius: 8px; padding: 12px; margin-top: 10px; font-family: monospace; font-size: 13px; white-space: pre-wrap; max-height: 300px; overflow-y: auto; display: none; border: 1px solid #333; }
+        .response.show { display: block; }
+        .status { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-left: 10px; }
+        .status-ok { background: #2ecc71; color: #000; }
+        .status-err { background: #e74c3c; color: white; }
+        .timing { color: #f39c12; font-size: 12px; margin-left: 10px; }
+        .chat-input { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #0f3460; background: #0a0a1a; color: #eee; font-size: 14px; margin: 8px 0; }
+        .streaming-text { color: #2ecc71; }
+        .info { background: #0f3460; padding: 10px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; }
+        .info code { background: #1a1a2e; padding: 2px 6px; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <h1>Junior.so OpenAI Proxy - Test Suite</h1>
+    <p class="subtitle">Testing OpenAI-compatible API format</p>
+
+    <div class="info">
+        <strong>Proxy URL:</strong> <code>http://localhost:8000/v1</code> &nbsp;|&nbsp;
+        <strong>Model:</strong> <code>junior</code> &nbsp;|&nbsp;
+        <strong>Format:</strong> OpenAI-compatible
+    </div>
+
+    <!-- Test 1: Models -->
+    <div class="test-section">
+        <div class="test-title">
+            <span class="method get">GET</span>
+            <span class="endpoint">/v1/models</span>
+            - List Available Models
+        </div>
+        <button class="btn btn-primary" onclick="testModels()">Run Test</button>
+        <span id="models-status"></span>
+        <span id="models-time" class="timing"></span>
+        <div id="models-response" class="response"></div>
+    </div>
+
+    <!-- Test 2: Chat (non-streaming) -->
+    <div class="test-section">
+        <div class="test-title">
+            <span class="method post">POST</span>
+            <span class="endpoint">/v1/chat/completions</span>
+            - Chat (Non-Streaming)
+        </div>
+        <input class="chat-input" id="chat-input" value="Xin chào, 1+1 bằng mấy?" placeholder="Type your message...">
+        <button class="btn btn-primary" onclick="testChat()">Send Message</button>
+        <span id="chat-status"></span>
+        <span id="chat-time" class="timing"></span>
+        <div id="chat-response" class="response"></div>
+    </div>
+
+    <!-- Test 3: Chat (streaming) -->
+    <div class="test-section">
+        <div class="test-title">
+            <span class="method post">POST</span>
+            <span class="endpoint">/v1/chat/completions</span>
+            - Chat (Streaming SSE)
+        </div>
+        <input class="chat-input" id="stream-input" value="Tell me a joke in Vietnamese" placeholder="Type your message...">
+        <button class="btn btn-stream" onclick="testStream()">Stream Response</button>
+        <span id="stream-status"></span>
+        <span id="stream-time" class="timing"></span>
+        <div id="stream-response" class="response"></div>
+    </div>
+
+    <script>
+        const BASE = 'http://localhost:8000';
+
+        async function testModels() {
+            const el = document.getElementById('models-response');
+            const st = document.getElementById('models-status');
+            const tm = document.getElementById('models-time');
+            el.className = 'response show';
+            el.textContent = 'Loading...';
+            const start = Date.now();
+
+            try {
+                const res = await fetch(BASE + '/v1/models');
+                const data = await res.json();
+                const elapsed = Date.now() - start;
+                el.textContent = JSON.stringify(data, null, 2);
+                st.innerHTML = '<span class="status status-ok">200 OK</span>';
+                tm.textContent = elapsed + 'ms';
+            } catch (e) {
+                el.textContent = 'Error: ' + e.message;
+                st.innerHTML = '<span class="status status-err">ERROR</span>';
+            }
+        }
+
+        async function testChat() {
+            const msg = document.getElementById('chat-input').value;
+            const el = document.getElementById('chat-response');
+            const st = document.getElementById('chat-status');
+            const tm = document.getElementById('chat-time');
+            el.className = 'response show';
+            el.textContent = 'Sending to Junior.so...';
+            const start = Date.now();
+
+            try {
+                const res = await fetch(BASE + '/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        model: 'junior',
+                        messages: [{role: 'user', content: msg}],
+                        stream: false
+                    })
+                });
+                const data = await res.json();
+                const elapsed = Date.now() - start;
+                el.textContent = JSON.stringify(data, null, 2);
+                st.innerHTML = '<span class="status status-ok">200 OK</span>';
+                tm.textContent = elapsed + 'ms';
+            } catch (e) {
+                el.textContent = 'Error: ' + e.message;
+                st.innerHTML = '<span class="status status-err">ERROR</span>';
+            }
+        }
+
+        async function testStream() {
+            const msg = document.getElementById('stream-input').value;
+            const el = document.getElementById('stream-response');
+            const st = document.getElementById('stream-status');
+            const tm = document.getElementById('stream-time');
+            el.className = 'response show';
+            el.innerHTML = '<span class="streaming-text">Connecting...</span>';
+            const start = Date.now();
+
+            try {
+                const res = await fetch(BASE + '/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        model: 'junior',
+                        messages: [{role: 'user', content: msg}],
+                        stream: true
+                    })
+                });
+
+                st.innerHTML = '<span class="status status-ok">STREAMING</span>';
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let fullText = '';
+                let rawEvents = '';
+
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    const chunk = decoder.decode(value);
+                    rawEvents += chunk;
+
+                    const lines = chunk.split('\n');
+                    for (const line of lines) {
+                        if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
+                                    fullText += data.choices[0].delta.content;
+                                }
+                                if (data.usage) {
+                                    fullText += '\n\n--- Token Usage ---\n';
+                                    fullText += 'Input: ' + data.usage.prompt_tokens + '\n';
+                                    fullText += 'Output: ' + data.usage.completion_tokens + '\n';
+                                    fullText += 'Total: ' + data.usage.total_tokens;
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    el.innerHTML = '<span class="streaming-text">' + fullText.replace(/</g,'&lt;') + '</span>';
+                }
+
+                const elapsed = Date.now() - start;
+                tm.textContent = elapsed + 'ms';
+                st.innerHTML = '<span class="status status-ok">DONE</span>';
+
+                el.innerHTML = '<span class="streaming-text">' + fullText.replace(/</g,'&lt;') + '</span>' +
+                    '\n\n<span style="color:#888">--- Raw SSE Events ---</span>\n' +
+                    rawEvents.replace(/</g,'&lt;');
+            } catch (e) {
+                el.textContent = 'Error: ' + e.message;
+                st.innerHTML = '<span class="status status-err">ERROR</span>';
+            }
+        }
+    </script>
+</body>
+</html>
